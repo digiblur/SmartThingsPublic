@@ -1,3 +1,5 @@
+#define MQTT_MAX_PACKET_SIZE 768
+#include <PubSubClient.h>
 #include <ESP8266WiFi.h>
 #include <DNSServer.h>            //Local DNS Server used for redirecting all requests to the configuration portal
 #include <ESP8266WebServer.h>     //Local WebServer used to serve the configuration portal
@@ -7,6 +9,8 @@
 ESP8266HTTPUpdateServer httpUpdater;
 #include <Arduino.h>
 
+#define control1_state_topic "%s/control1/state"
+#define control1_set_topic "%s/control1/set"
 #define SONOFF
 //#define SONOFF_TH
 //#define SONOFF_S20
@@ -27,11 +31,19 @@ ESP8266HTTPUpdateServer httpUpdater;
 #include <DallasTemperature.h>
 #endif
 
+WiFiClient espClient;
+PubSubClient mqclient(espClient);
+
 String message = "";
 
 String inputString = "";         // a string to hold incoming data
 boolean stringComplete = false;  // whether the string is complete
 int currentStatus = LOW;
+
+char on_cmd[3] = "on";
+char off_cmd[4] = "off";
+char control1_set_top[40];
+char control1_state_top[40];
 
 boolean needUpdate1 = true;
 boolean needUpdate2 = true;
@@ -64,7 +76,7 @@ unsigned long current_low_ext;
 
 #if defined SONOFF || defined ECOPLUG
 const char * projectName = "Sonoff";
-String softwareVersion = "2.0.5";
+String softwareVersion = "2.1.0MQ";
 #endif
 #ifdef SONOFF_S20
 const char * projectName = "Sonoff S20";
@@ -381,6 +393,11 @@ int WebLoggedInTimer = 2;
 String printWebString = "";
 boolean printToWeb = false;
 
+#define DEFAULT_MQTT_SERVER            "0.0.0.0"
+#define DEFAULT_MQTT_PORT              1883
+#define DEFAULT_MQTT_USER              ""
+#define DEFAULT_MQTT_PASS              ""
+#define DEFAULT_USE_MQTT               false
 #define DEFAULT_HAIP                   "0.0.0.0"
 #define DEFAULT_HAPORT                 39500
 #define DEFAULT_RESETWIFI              false
@@ -445,6 +462,11 @@ struct SettingsStruct
   int           debounce;
   int           externalType;
   char          hostName[26];
+  boolean       useMQTT;
+  char          mqUser[30];
+  char          mqPass[30];
+  byte          mqIP[4];
+  unsigned int  mqPort;
 #endif
 #ifdef SONOFF_POW
   int           wReport;
@@ -460,6 +482,11 @@ struct SettingsStruct
   int           externalType;
   char          hostName[26];
   int           voltage;
+  boolean       useMQTT;
+  char          mqUser[30];
+  char          mqPass[30];
+  byte          mqIP[4];
+  unsigned int  mqPort;
 #endif
 #ifdef SONOFF_TH
   boolean       useFahrenheit;
@@ -474,6 +501,11 @@ struct SettingsStruct
   int           debounce;
   int           externalType;
   char          hostName[26];
+  boolean       useMQTT;
+  char          mqUser[30];
+  char          mqPass[30];
+  byte          mqIP[4];
+  unsigned int  mqPort;
 #endif
 #if defined SONOFF_DUAL
   int           usePort;
@@ -485,6 +517,11 @@ struct SettingsStruct
   int           debounce;
   int           externalType;
   char          hostName[26];
+  boolean       useMQTT;
+  char          mqUser[30];
+  char          mqPass[30];
+  byte          mqIP[4];
+  unsigned int  mqPort;
 #endif
 #if defined SONOFF_4CH
   int           usePort;
@@ -500,6 +537,11 @@ struct SettingsStruct
   int           debounce;
   int           externalType;
   char          hostName[26];
+  boolean       useMQTT;
+  char          mqUser[30];
+  char          mqPass[30];
+  byte          mqIP[4];
+  unsigned int  mqPort;
 #endif
 } Settings;
 
@@ -808,7 +850,7 @@ void relayControl(int relay, int value) {
   }
   if (Settings.powerOnState == 2 || Settings.powerOnState == 3)
   {
-    SaveSettings();
+    SaveSettings(1);
   }
 
 }
@@ -831,13 +873,13 @@ void relayToggle1() {
     else if ((current_high1 - current_low1) >= 10000 && (current_high1 - current_low1) < 20000)
     {
       Settings.longPress = true;
-      SaveSettings();
+      SaveSettings(1);
       ESP.restart();
     }
     else if ((current_high1 - current_low1) >= 20000 && (current_high1 - current_low1) < 60000)
     {
       Settings.reallyLongPress = true;
-      SaveSettings();
+      SaveSettings(1);
       ESP.restart();
     }
   }
@@ -1081,6 +1123,13 @@ void runEach5Minutes()
 
 }
 
+bool sendpub(char* topic, char* mqmess, bool retain = true) {
+    char myPubMsg[80];
+    sprintf(myPubMsg,"%s = %s",topic,mqmess);
+    Serial.println(myPubMsg);
+    return mqclient.publish(topic, mqmess, retain);
+}
+
 boolean sendStatus(int number) {
   String authHeader = "";
   boolean success = false;
@@ -1088,21 +1137,30 @@ boolean sendStatus(int number) {
   char host[20];
   sprintf_P(host, PSTR("%u.%u.%u.%u"), Settings.haIP[0], Settings.haIP[1], Settings.haIP[2], Settings.haIP[3]);
 
+  Serial.print("Sendstatus#");
+  Serial.print(number);
+  Serial.print(":host->");
+  Serial.println(host);
   //client.setTimeout(1000);
   if (Settings.haIP[0] + Settings.haIP[1] + Settings.haIP[2] + Settings.haIP[3] == 0) { // HA host is not configured
+    Serial.println("HA Not Config'd");
     return false;
   }
   if (connectionFailures >= 3) { // Too many errors; Trying not to get stuck
     if (millis() - failureTimeout < 1800000) {
+      Serial.println("Too many Connection Failures");
       return false;
     } else {
       failureTimeout = millis();
+      Serial.print("Fail TimeOut:");
+      Serial.println(failureTimeout);
     }
   }
   // Use WiFiClient class to create TCP connections
   WiFiClient client;
   if (!client.connect(host, Settings.haPort))
   {
+    Serial.println("ConnectionFailure to HA");
     connectionFailures++;
     return false;
   }
@@ -1117,11 +1175,17 @@ boolean sendStatus(int number) {
       message = "{\"type\":\"relay\", \"number\":\"0\", \"power\":\"" + String(Settings.currentState1 == true || Settings.currentState2 == true || Settings.currentState3 == true || Settings.currentState4 == true? "on" : "off") + "\"}";
       #else
       message = "{\"type\":\"relay\", \"number\":\"0\", \"power\":\"" + String(Settings.currentState1 == true? "on" : "off") + "\"}";
+      if (Settings.useMQTT == true) {
+        sendpub(control1_state_top,(Settings.currentState1 == true? on_cmd : off_cmd),true);
+      }
       #endif
       break;
     }
     case 1: {
       message = "{\"type\":\"relay\", \"number\":\"1\", \"power\":\"" + String(Settings.currentState1 == true? "on" : "off") + "\"}";
+      if (Settings.useMQTT == true) {
+        sendpub(control1_state_top,(Settings.currentState1 == true? on_cmd : off_cmd),true);
+      }
       break;
     }
     #if defined SONOFF_DUAL || defined SONOFF_4CH
@@ -1149,7 +1213,6 @@ boolean sendStatus(int number) {
   // We now create a URI for the request
   String url = F("/");
   //url += event->idx;
-
   client.print(String("POST ") + url + " HTTP/1.1\r\n" +
                "Host: " + host + ":" + Settings.haPort + "\r\n" + authHeader +
                "Content-Type: application/json;charset=utf-8\r\n" +
@@ -1164,6 +1227,8 @@ boolean sendStatus(int number) {
   // Read all the lines of the reply from server and print them to Serial
   while (client.available()) {
     String line = client.readStringUntil('\n');
+//    Serial.print("HAReply:");
+//    Serial.println(line);
     if (line.substring(0, 15) == "HTTP/1.1 200 OK")
     {
       success = true;
@@ -1359,10 +1424,14 @@ String deblank(const char* input)
   return output;
 }
 
-void SaveSettings(void)
+void SaveSettings(int setnum)
 {
-  SaveToFlash(0, (byte*)&Settings, sizeof(struct SettingsStruct));
-  SaveToFlash(32768, (byte*)&SecuritySettings, sizeof(struct SecurityStruct));
+  if (setnum == 99) {
+    SaveToFlash(0, (byte*)&Settings, sizeof(struct SettingsStruct));
+  } else {
+    SaveToFlash(0, (byte*)&Settings, sizeof(struct SettingsStruct));
+    SaveToFlash(32768, (byte*)&SecuritySettings, sizeof(struct SecurityStruct));
+  }
 }
 
 boolean LoadSettings()
@@ -1400,7 +1469,7 @@ void SaveToFlash(int index, byte* memAddress, int datasize)
   if (spi_flash_erase_sector(_sector) == SPI_FLASH_RESULT_OK)
     if (spi_flash_write(_sector * SPI_FLASH_SEC_SIZE, reinterpret_cast<uint32_t*>(data), FLASH_EEPROM_SIZE) == SPI_FLASH_RESULT_OK)
     {
-      //Serial.println("flash save ok");
+      Serial.println("flash save ok");
     }
   interrupts();
   delete [] data;
@@ -1441,8 +1510,8 @@ void EraseFlash()
     if (spi_flash_erase_sector(_sector) == SPI_FLASH_RESULT_OK)
     {
       interrupts();
-      //Serial.print(F("FLASH: Erase Sector: "));
-      //Serial.println(_sector);
+//      Serial.print(F("FLASH: Erase Sector: "));
+//      Serial.println(_sector);
       delay(10);
     }
     interrupts();
@@ -1472,8 +1541,8 @@ void ZeroFillFlash()
       if (spi_flash_write(_sector * SPI_FLASH_SEC_SIZE, reinterpret_cast<uint32_t*>(data), FLASH_EEPROM_SIZE) == SPI_FLASH_RESULT_OK)
       {
         interrupts();
-        //Serial.print(F("FLASH: Zero Fill Sector: "));
-        //Serial.println(_sector);
+//        Serial.print(F("FLASH: Zero Fill Sector: "));
+//        Serial.println(_sector);
         delay(10);
       }
   }
@@ -1548,7 +1617,7 @@ void setup()
   pinMode(LED_PIN1, OUTPUT);
 
   // Setup console
-  Serial.begin(19200);
+  Serial.begin(115200);
   delay(10);
   //Serial1.println();
   //Serial1.println();
@@ -1568,7 +1637,7 @@ void setup()
     Settings.longPress = false;
     Settings.useStatic = false;
     Settings.resetWifi = true;
-    SaveSettings();
+    SaveSettings(1);
     LEDoff1;
   }
   //Settings.reallyLongPress = true;
@@ -1733,8 +1802,19 @@ void setup()
     saveSettings = true;
   }
 
+  if (SecuritySettings.settingsVersion < 207) {
+    Settings.mqPort = DEFAULT_MQTT_PORT;
+    str2ip((char*)DEFAULT_MQTT_SERVER, Settings.mqIP);
+    strncpy(Settings.mqUser, DEFAULT_MQTT_USER, sizeof(Settings.mqUser));
+    strncpy(Settings.mqPass, DEFAULT_MQTT_PASS, sizeof(Settings.mqPass));
+    Settings.useMQTT = DEFAULT_USE_MQTT;
+    SecuritySettings.settingsVersion = 207;
+    saveSettings = true;
+  }
+
+
   if (saveSettings == true) {
-    SaveSettings();
+    SaveSettings(1);
   }
 
   WiFiManager wifiManager;
@@ -1747,21 +1827,25 @@ void setup()
   }
 
   if (Settings.hostName[0] != 0) {
-    wifiManager.setHostName(Settings.hostName);
+      WiFi.hostname(Settings.hostName);
+//    wifi_station_set_hostname(Settings.hostName);
+//    wifiManager.setHostName(Settings.hostName);
+//    WiFiManager.setHostname(Settings.hostName);
   }
 
   if (Settings.resetWifi == true) {
+    Serial.println("Reset WiFi == true branch");
     wifiManager.resetSettings();
     Settings.resetWifi = false;
-    SaveSettings();
+    SaveSettings(1);
   }
 
   WiFi.macAddress(mac);
 
   String apSSID = deblank(projectName) + "." + String(mac[0], HEX) + String(mac[1], HEX) + String(mac[2], HEX) + String(mac[3], HEX) + String(mac[4], HEX) + String(mac[5], HEX);
-
+  Serial.println(apSSID);
   if (!wifiManager.autoConnect(apSSID.c_str(), "configme")) {
-    //Serial.println("failed to connect, we should reset as see if it connects");
+    Serial.println("failed to connect, we should reset as see if it connects");
     delay(3000);
     ESP.reset();
     delay(5000);
@@ -1816,7 +1900,7 @@ void setup()
   server->on("/reset", []() {
     server->send(200, "application/json", "{\"message\":\"wifi settings are being removed\"}");
     Settings.reallyLongPress = true;
-    SaveSettings();
+    SaveSettings(1);
     ESP.restart();
   });
 
@@ -1854,6 +1938,13 @@ void setup()
     String uReport = server->arg("ureport");
     String debounce = server->arg("debounce");
     String hostname = server->arg("hostname");
+
+    String usemqtt = server->arg("usemqtt");
+    String mqIP = server->arg("mqip");
+    String mqPort = server->arg("mqport");
+    String mqUser = server->arg("mqttuser");
+    String mqPass = server->arg("mqttpass");
+
     #if defined SONOFF || defined SONOFF_TH
     String switchType = server->arg("switchtype");
     String externalType = server->arg("externaltype");
@@ -1880,6 +1971,11 @@ void setup()
     #endif
 
     if(server->args() > 0){
+      if (mqPort.length() != 0)
+      {
+        Settings.mqPort = mqPort.toInt();
+        needReboot = true;
+      }
       if (haPort.length() != 0)
       {
         Settings.haPort = haPort.toInt();
@@ -1892,6 +1988,13 @@ void setup()
       {
         haIP.toCharArray(tmpString, 26);
         str2ip(tmpString, Settings.haIP);
+      }
+
+      if (mqIP.length() != 0)
+      {
+        mqIP.toCharArray(tmpString, 26);
+        str2ip(tmpString, Settings.mqIP);
+        needReboot = true;
       }
       
       if (ip.length() != 0 && subnet.length() != 0) 
@@ -1912,6 +2015,11 @@ void setup()
       {
         dns.toCharArray(tmpString, 26);
         str2ip(tmpString, Settings.DNS);
+      }
+      if (usemqtt.length() != 0)
+      {
+        if ((usemqtt == "yes") != Settings.useMQTT) needReboot = true;
+        Settings.useMQTT = (usemqtt == "yes");
       }
       if (usestatic.length() != 0)
       {
@@ -1952,6 +2060,12 @@ void setup()
       if (hostname != Settings.hostName) needReboot = true;
       WiFi.hostname(hostname.c_str());
       strncpy(Settings.hostName, hostname.c_str(), sizeof(Settings.hostName));
+
+      if (mqUser != Settings.mqUser) needReboot = true;
+      strncpy(Settings.mqUser, mqUser.c_str(), sizeof(Settings.mqUser));
+      if (mqPass != Settings.mqPass) needReboot = true;
+      strncpy(Settings.mqPass, mqPass.c_str(), sizeof(Settings.mqPass));
+
   #if defined SONOFF || defined SONOFF_TH
       if (externalType.length() != 0)
       {
@@ -2035,7 +2149,7 @@ void setup()
       #endif
     }
 
-    SaveSettings();
+    SaveSettings(1);
 
     String reply = "";
     char str[20];
@@ -2149,9 +2263,38 @@ void setup()
     reply += F("'><TR><TD>HA Controller Port:<TD><input type='text' name='haport' value='");
     reply += Settings.haPort;
 
+    reply += F("'><TR><TD>Use MQTT:<TD>");
+
+    reply += F("<input type='radio' name='usemqtt' value='yes'");
+    if (Settings.useMQTT)
+      reply += F(" checked ");
+    reply += F(">Yes");
+    reply += F("</input>");
+
+    reply += F("<input type='radio' name='usemqtt' value='no'");
+    if (!Settings.useMQTT)
+      reply += F(" checked ");
+    reply += F(">No");
+    reply += F("</input>");
+
+    reply += F("<TR><TD><TD><TR><TD>Topic:<TD>(hostname)/control1/(set and state)<BR><BR>");
+
+    reply += F("<TR><TD>MQTT Server:<TD><input type='text' name='mqip' value='");
+    sprintf_P(str, PSTR("%u.%u.%u.%u"), Settings.mqIP[0], Settings.mqIP[1], Settings.mqIP[2], Settings.mqIP[3]);
+    reply += str;
+
+    reply += F("'><TR><TD>MQTT Server Port:<TD><input type='text' name='mqport' value='");
+    reply += Settings.mqPort;
+
+    reply += F("'><TR><TD>MQTT Username:<TD><input type='text' id='mqttuser' name='mqttuser' value='");
+    reply += Settings.mqUser;
+
+    reply += F("'><TR><TD>MQTT Password:<TD><input type='text' id='mqttpass' name='mqttpass' value='");
+    reply += Settings.mqPass;
+    reply += F("'>");    
 
     byte choice = Settings.powerOnState;
-    reply += F("'><TR><TD>Boot Up State:<TD><select name='");
+    reply += F("<TR><TD>Boot Up State:<TD><select name='");
     reply += "pos";
     reply += "'>";
     if (choice == 0) {
@@ -2789,7 +2932,7 @@ void setup()
     #endif
 
     if ( reply != "" ) {
-      SaveSettings();
+      SaveSettings(1);
       server->send(200, "application/json", reply);
     } else {
       server->send(200, "application/json", "{\"success\":\"false\", \"type\":\"configuration\"}");
@@ -3009,10 +3152,10 @@ void setup()
   if (ESP.getFlashChipRealSize() > 524288) {
     if (Settings.usePassword == true && SecuritySettings.Password[0] != 0) {
       httpUpdater.setup(&*server, "/update", "admin", SecuritySettings.Password);
-      httpUpdater.setProjectName(projectName);
+//      httpUpdater.setProjectName(projectName);
     } else {
       httpUpdater.setup(&*server);
-      httpUpdater.setProjectName(projectName);
+//      httpUpdater.setProjectName(projectName);
     }
   }
 
@@ -3020,7 +3163,7 @@ void setup()
 
   server->begin();
 
-  //Serial.printf("Starting SSDP...\n");
+  Serial.println("Starting SSDP.");
   SSDP.setSchemaURL("description.xml");
   SSDP.setHTTPPort(80);
   SSDP.setName(projectName);
@@ -3032,17 +3175,95 @@ void setup()
   SSDP.setManufacturer("Smart Life Automated");
   SSDP.setManufacturerURL("http://smartlife.tech");
   SSDP.begin();
+  Serial.println("SSDP Done.");
 
-  //Serial.println("HTTP server started");
-  //Serial.println(WiFi.localIP());
+
+  if (Settings.useMQTT == true) {
+//    Serial.println("MQ1");
+    sprintf(control1_set_top, control1_set_topic, Settings.hostName);
+//    Serial.println("MQ2");
+    sprintf(control1_state_top, control1_state_topic, Settings.hostName);
+//    Serial.println("MQ3");
+    mqclient.setServer(Settings.mqIP, Settings.mqPort);
+//    Serial.println("MQ4");
+    mqclient.setCallback(callback);
+//    Serial.println("MQ5"); 
+    reconnect();
+//    Serial.println("MQ6");
+  }
+
+
+
+  Serial.println("HTTP server started");
+  Serial.println(WiFi.localIP());
 
   timerUptime = millis() + Settings.uReport * 1000;
 
 }
 
+void callback(char* topic, byte* payload, unsigned int length) {
+
+//  Serial.print("Message arrived [");
+//  Serial.print(topic);
+//  Serial.print("]= '");
+
+  char messagep[length + 1];
+  for (int i = 0; i < length; i++) {
+    messagep[i] = (char)payload[i];
+  }
+  messagep[length] = '\0';
+  
+//  Serial.print(messagep);
+//  Serial.println("'");
+
+  if (strcmp(topic,control1_set_top)==0) {
+     Serial.println("Control1 Set Topic Rcvd");
+     if (strcmp(messagep,"off")==0) {
+       Serial.println("Recvd Control1 off from MQTT - Sending Relay(1,0)");
+       relayControl(1, 0);
+     }
+     if (strcmp(messagep,"on")==0) {
+       Serial.println("Recvd Control1 on from MQTT - Sending Relay(1,1)");
+       relayControl(1, 1);
+    }
+  }
+}
+void reconnect() {
+  // Loop until we're reconnected
+  while (!mqclient.connected()) {
+    Serial.print("Attempting MQTT connection...");
+    // Attempt to connect
+    if (mqclient.connect(Settings.hostName, Settings.mqUser, Settings.mqPass)) {
+      Serial.println("connected");
+      mqclient.subscribe(control1_set_top);
+    } else {
+      Serial.print("failed, rc=");
+      Serial.print(mqclient.state());
+      Serial.println(" try again in 5 seconds");
+      // Wait 5 seconds before retrying
+      delay(5000);
+    }
+  }
+}
+
+/****reset***/
+void software_Reset() // Restarts program from beginning but does not reset the peripherals and registers
+{
+Serial.print("resetting");
+ESP.reset(); 
+}
+
 void loop()
 {
   server->handleClient();
+
+  if (Settings.useMQTT == true) {
+    if (!mqclient.connected()) {
+      // reconnect();
+      software_Reset();
+    }
+    mqclient.loop();
+  }
 
   #if defined SONOFF_DUAL
   buttonLoop();
